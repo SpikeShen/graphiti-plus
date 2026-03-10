@@ -38,7 +38,7 @@ EMBEDDING_DIM = int(os.environ.get('BEDROCK_EMBEDDING_DIM', '1024'))
 LLM_TEMPERATURE = float(os.environ.get('LLM_TEMPERATURE', '0.1'))
 S3_VECTORS_BUCKET = os.environ['S3_VECTORS_BUCKET']
 
-CORPUS_PATH = os.path.join(os.path.dirname(__file__), '../../../corpus/三国演义.txt')
+CORPUS_PATH = os.path.join(os.path.dirname(__file__), '三国演义.txt')
 GROUP_ID = 'sanguo-test'
 
 

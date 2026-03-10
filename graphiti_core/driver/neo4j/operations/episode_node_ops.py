@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -48,6 +49,12 @@ class Neo4jEpisodeNodeOperations(EpisodeNodeOperations):
             'source_description': node.source_description,
             'content': node.content,
             'entity_edges': node.entity_edges,
+            'narrative_excerpts': json.dumps(node.narrative_excerpts, ensure_ascii=False),
+            'describes_edges': json.dumps(node.describes_edges, ensure_ascii=False),
+            'content_blocks': json.dumps(
+                [block.model_dump(mode='json') for block in node.content_blocks],
+                ensure_ascii=False,
+            ) if node.content_blocks else '[]',
             'created_at': node.created_at,
             'valid_at': node.valid_at,
             'source': node.source.value,
@@ -71,6 +78,12 @@ class Neo4jEpisodeNodeOperations(EpisodeNodeOperations):
             ep = dict(node)
             ep['source'] = str(ep['source'].value)
             ep.pop('labels', None)
+            ep['narrative_excerpts'] = json.dumps(node.narrative_excerpts, ensure_ascii=False)
+            ep['describes_edges'] = json.dumps(node.describes_edges, ensure_ascii=False)
+            ep['content_blocks'] = json.dumps(
+                [block.model_dump(mode='json') for block in node.content_blocks],
+                ensure_ascii=False,
+            ) if node.content_blocks else '[]'
             episodes.append(ep)
 
         query = get_episode_node_save_bulk_query(GraphProvider.NEO4J)

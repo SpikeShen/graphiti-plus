@@ -14,12 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
+
 import logging
 from collections import defaultdict
 from time import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from graphiti_core.vector_store.s3_vectors_client import S3VectorsClient
 from numpy._typing import NDArray
 from typing_extensions import LiteralString
 
@@ -2059,3 +2064,187 @@ async def get_embeddings_for_edges(
             embeddings_dict[uuid] = embedding
 
     return embeddings_dict
+
+# ------------------------------------------------------------------ #
+#  S3 Vectors bridge functions
+# ------------------------------------------------------------------ #
+
+async def s3_vectors_edge_similarity_search(
+    s3_vectors: 'S3VectorsClient',
+    driver: GraphDriver,
+    search_vector: list[float],
+    search_filter: SearchFilters,
+    group_ids: list[str] | None = None,
+    limit: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> list[EntityEdge]:
+    """Search edges via S3 Vectors, then fetch full records from Neo4j."""
+    results = s3_vectors.query_edge_vectors(
+        query_vector=search_vector,
+        group_ids=group_ids,
+        top_k=limit,
+        min_score=min_score,
+    )
+    if not results:
+        return []
+
+    uuids = [r.key for r in results]
+    edges = await EntityEdge.get_by_uuids(driver, uuids)
+
+    # Preserve S3 Vectors ranking order
+    edge_map = {e.uuid: e for e in edges}
+    return [edge_map[uuid] for uuid in uuids if uuid in edge_map]
+
+
+async def s3_vectors_node_similarity_search(
+    s3_vectors: 'S3VectorsClient',
+    driver: GraphDriver,
+    search_vector: list[float],
+    search_filter: SearchFilters,
+    group_ids: list[str] | None = None,
+    limit: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> list[EntityNode]:
+    """Search nodes via S3 Vectors, then fetch full records from Neo4j."""
+    results = s3_vectors.query_entity_vectors(
+        query_vector=search_vector,
+        group_ids=group_ids,
+        top_k=limit,
+        min_score=min_score,
+    )
+    if not results:
+        return []
+
+    uuids = [r.key for r in results]
+    nodes = await EntityNode.get_by_uuids(driver, uuids)
+
+    # Preserve S3 Vectors ranking order
+    node_map = {n.uuid: n for n in nodes}
+    return [node_map[uuid] for uuid in uuids if uuid in node_map]
+
+
+async def s3_vectors_community_similarity_search(
+    s3_vectors: 'S3VectorsClient',
+    driver: GraphDriver,
+    search_vector: list[float],
+    group_ids: list[str] | None = None,
+    limit: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> list[CommunityNode]:
+    """Search communities via S3 Vectors, then fetch full records from Neo4j."""
+    results = s3_vectors.query_community_vectors(
+        query_vector=search_vector,
+        group_ids=group_ids,
+        top_k=limit,
+        min_score=min_score,
+    )
+    if not results:
+        return []
+
+    uuids = [r.key for r in results]
+    communities = await CommunityNode.get_by_uuids(driver, uuids)
+
+    # Preserve S3 Vectors ranking order
+    comm_map = {c.uuid: c for c in communities}
+    return [comm_map[uuid] for uuid in uuids if uuid in comm_map]
+
+
+
+async def s3_vectors_edge_source_similarity_search(
+    s3_vectors: 'S3VectorsClient',
+    driver: GraphDriver,
+    search_vector: list[float],
+    search_filter: SearchFilters,
+    group_ids: list[str] | None = None,
+    limit: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> list[EntityEdge]:
+    """Search edges via S3 Vectors source_excerpt embeddings, then fetch full records from Neo4j."""
+    results = s3_vectors.query_edge_source_vectors(
+        query_vector=search_vector,
+        group_ids=group_ids,
+        top_k=limit,
+        min_score=min_score,
+    )
+    if not results:
+        return []
+
+    uuids = [r.key for r in results]
+    edges = await EntityEdge.get_by_uuids(driver, uuids)
+
+    # Preserve S3 Vectors ranking order
+    edge_map = {e.uuid: e for e in edges}
+    return [edge_map[uuid] for uuid in uuids if uuid in edge_map]
+
+
+async def s3_vectors_node_source_similarity_search(
+    s3_vectors: 'S3VectorsClient',
+    driver: GraphDriver,
+    search_vector: list[float],
+    search_filter: SearchFilters,
+    group_ids: list[str] | None = None,
+    limit: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> list[EntityNode]:
+    """Search DescribesEdge excerpts via S3 Vectors, return the target EntityNodes.
+
+    Searches describes-excerpt-embeddings index, then uses target_node_uuid
+    from metadata to fetch the associated EntityNodes. Deduplicates by node UUID
+    (one node may have multiple DescribesEdge hits).
+    """
+    results = s3_vectors.query_describes_excerpt_vectors(
+        query_vector=search_vector,
+        group_ids=group_ids,
+        top_k=limit,
+        min_score=min_score,
+    )
+    if not results:
+        return []
+
+    # Extract target_node_uuid from metadata, deduplicate preserving order
+    node_uuids = list(dict.fromkeys(
+        r.metadata.get('target_node_uuid') for r in results if r.metadata.get('target_node_uuid')
+    ))
+    if not node_uuids:
+        return []
+
+    nodes = await EntityNode.get_by_uuids(driver, node_uuids)
+    uuid_to_node = {n.uuid: n for n in nodes}
+    return [uuid_to_node[uid] for uid in node_uuids if uid in uuid_to_node]
+
+
+async def s3_vectors_narrative_search(
+    s3_vectors: 'S3VectorsClient',
+    search_vector: list[float],
+    group_ids: list[str] | None = None,
+    limit: int = RELEVANT_SCHEMA_LIMIT,
+    min_score: float = DEFAULT_MIN_SCORE,
+) -> list[dict[str, Any]]:
+    """Search episode narratives via S3 Vectors. Returns dicts with key, score, excerpt, episode_uuid."""
+    results = s3_vectors.query_narrative_vectors(
+        query_vector=search_vector,
+        group_ids=group_ids,
+        top_k=limit,
+        min_score=min_score,
+    )
+    if not results:
+        return []
+
+    # Deduplicate by normalized excerpt text (strip punctuation differences)
+    seen_texts: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for r in results:
+        excerpt = r.metadata.get('excerpt', '')
+        # Normalize: strip trailing punctuation for comparison
+        normalized = excerpt.rstrip('。，；！？、,.;!? ')
+        if normalized in seen_texts:
+            continue
+        seen_texts.add(normalized)
+        deduped.append({
+            'key': r.key,
+            'score': r.score,
+            'excerpt': excerpt,
+            'episode_uuid': r.metadata.get('episode_uuid', ''),
+        })
+
+    return deduped

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import base64
 from typing import Any, Protocol, TypedDict
 
 from pydantic import BaseModel, Field
@@ -67,6 +68,7 @@ class Versions(TypedDict):
     extract_message: PromptFunction
     extract_json: PromptFunction
     extract_text: PromptFunction
+    extract_document: PromptFunction
     classify_nodes: PromptFunction
     extract_attributes: PromptFunction
     extract_summary: PromptFunction
@@ -183,6 +185,79 @@ Guidelines:
     return [
         Message(role='system', content=sys_prompt),
         Message(role='user', content=user_prompt),
+    ]
+
+def extract_document(context: dict[str, Any]) -> list[Message]:
+    """Build a multimodal entity extraction prompt for document-type episodes.
+
+    When ``content_blocks`` is present in *context* and contains image blocks
+    with ``_raw_bytes``, the user message is constructed as a content-array
+    (OpenAI multimodal format) so that a vision-capable LLM can directly
+    understand the images.  If no raw bytes are available (e.g. after S3
+    upload), the image's ``description`` text is used as a fallback.
+    """
+    from graphiti_core.nodes import ContentBlockType
+
+    content_blocks = context.get('content_blocks', [])
+
+    sys_prompt = (
+        'You are an AI assistant that extracts entity nodes from documents. '
+        'The document may contain text and images. '
+        'Your primary task is to extract and classify significant entities '
+        'mentioned or depicted in the provided document content.'
+    )
+
+    # --- Build multimodal user content parts ---
+    user_parts: list[dict[str, Any]] = []
+
+    user_parts.append({
+        'type': 'text',
+        'text': (
+            f'<ENTITY TYPES>\n{context["entity_types"]}\n</ENTITY TYPES>\n\n'
+            '<DOCUMENT CONTENT>\n'
+        ),
+    })
+
+    for block in sorted(content_blocks, key=lambda b: b.index):
+        if block.parent_index is not None:
+            continue
+        if block.block_type == ContentBlockType.text:
+            if block.text:
+                user_parts.append({'type': 'text', 'text': block.text})
+        elif block.block_type == ContentBlockType.image:
+            if block._raw_bytes:
+                b64 = base64.b64encode(block._raw_bytes).decode('utf-8')
+                mime = block.mime_type or 'image/jpeg'
+                user_parts.append({
+                    'type': 'image_url',
+                    'image_url': {'url': f'data:{mime};base64,{b64}'},
+                })
+            elif block.description:
+                user_parts.append({'type': 'text', 'text': block.text_representation})
+        else:
+            user_parts.append({'type': 'text', 'text': block.text_representation})
+
+    instructions = f"""\n</DOCUMENT CONTENT>
+
+Given the above document content (which may include images), extract entities that are
+explicitly or implicitly mentioned or depicted.
+For each entity extracted, also determine its entity type based on the provided ENTITY TYPES
+and their descriptions. Indicate the classified entity type by providing its entity_type_id.
+
+{context['custom_extraction_instructions']}
+
+Guidelines:
+1. Extract significant entities, concepts, or actors mentioned in the text or depicted in images.
+2. For images, extract entities that are clearly visible or identifiable (people, objects, locations, logos, etc.).
+3. Avoid creating nodes for relationships or actions.
+4. Avoid creating nodes for temporal information like dates, times or years (these will be added to edges later).
+5. Be as explicit as possible in your node names, using full names and avoiding abbreviations.
+"""
+    user_parts.append({'type': 'text', 'text': instructions})
+
+    return [
+        Message(role='system', content=sys_prompt),
+        Message(role='user', content=user_parts),
     ]
 
 
@@ -309,6 +384,7 @@ versions: Versions = {
     'extract_message': extract_message,
     'extract_json': extract_json,
     'extract_text': extract_text,
+    'extract_document': extract_document,
     'extract_summary': extract_summary,
     'extract_summaries_batch': extract_summaries_batch,
     'classify_nodes': classify_nodes,

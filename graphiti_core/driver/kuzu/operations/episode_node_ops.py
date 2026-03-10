@@ -47,6 +47,7 @@ class KuzuEpisodeNodeOperations(EpisodeNodeOperations):
             'source_description': node.source_description,
             'content': node.content,
             'entity_edges': node.entity_edges,
+            'narrative_excerpts': node.narrative_excerpts,
             'created_at': node.created_at,
             'valid_at': node.valid_at,
             'source': node.source.value,

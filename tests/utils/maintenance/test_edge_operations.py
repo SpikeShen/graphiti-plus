@@ -181,6 +181,7 @@ async def test_resolve_extracted_edges_keeps_unknown_names(monkeypatch):
         llm_client=llm_client,
         embedder=MagicMock(),
         cross_encoder=MagicMock(),
+        image_embedding_map=None,
     )
 
     source_node = EntityNode(
@@ -370,6 +371,7 @@ async def test_resolve_extracted_edges_fast_path_deduplication(monkeypatch):
         llm_client=llm_client,
         embedder=MagicMock(),
         cross_encoder=MagicMock(),
+        image_embedding_map=None,
     )
 
     source_node = EntityNode(

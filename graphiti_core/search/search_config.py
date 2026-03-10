@@ -33,12 +33,14 @@ class EdgeSearchMethod(Enum):
     cosine_similarity = 'cosine_similarity'
     bm25 = 'bm25'
     bfs = 'breadth_first_search'
+    source_similarity = 'source_similarity'
 
 
 class NodeSearchMethod(Enum):
     cosine_similarity = 'cosine_similarity'
     bm25 = 'bm25'
     bfs = 'breadth_first_search'
+    source_similarity = 'source_similarity'
 
 
 class EpisodeSearchMethod(Enum):
@@ -127,6 +129,10 @@ class SearchResults(BaseModel):
     episode_reranker_scores: list[float] = Field(default_factory=list)
     communities: list[CommunityNode] = Field(default_factory=list)
     community_reranker_scores: list[float] = Field(default_factory=list)
+    narrative_excerpts: list[dict] = Field(
+        default_factory=list,
+        description='Episode narrative excerpts from S3 Vectors (deep search only). Each dict has: key, score, excerpt, episode_uuid.',
+    )
 
     @classmethod
     def merge(cls, results_list: list['SearchResults']) -> 'SearchResults':
@@ -156,5 +162,6 @@ class SearchResults(BaseModel):
             merged.episode_reranker_scores.extend(result.episode_reranker_scores)
             merged.communities.extend(result.communities)
             merged.community_reranker_scores.extend(result.community_reranker_scores)
+            merged.narrative_excerpts.extend(result.narrative_excerpts)
 
         return merged

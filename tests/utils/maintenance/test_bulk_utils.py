@@ -245,7 +245,7 @@ async def test_dedupe_edges_bulk_deduplicates_within_episode(monkeypatch):
     comparisons_made = []
 
     # Create mock embedder that sets embedding values
-    async def mock_create_embeddings(embedder, edges):
+    async def mock_create_embeddings(embedder, edges, image_embedding_map=None):
         for edge in edges:
             edge.fact_embedding = [0.1, 0.2, 0.3]
 
@@ -367,7 +367,7 @@ async def test_extract_nodes_and_edges_bulk_passes_custom_instructions_to_extrac
         edge_types=None,
         custom_extraction_instructions=None,
     ):
-        return []
+        return [], []
 
     monkeypatch.setattr(bulk_utils, 'extract_nodes', mock_extract_nodes)
     monkeypatch.setattr(bulk_utils, 'extract_edges', mock_extract_edges)
@@ -425,7 +425,7 @@ async def test_extract_nodes_and_edges_bulk_passes_custom_instructions_to_extrac
                 'custom_extraction_instructions': custom_extraction_instructions,
             }
         )
-        return []
+        return [], []
 
     monkeypatch.setattr(bulk_utils, 'extract_nodes', mock_extract_nodes)
     monkeypatch.setattr(bulk_utils, 'extract_edges', mock_extract_edges)
@@ -479,7 +479,7 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_none_by_default(
         extract_edges_calls.append(
             {'custom_extraction_instructions': custom_extraction_instructions}
         )
-        return []
+        return [], []
 
     monkeypatch.setattr(bulk_utils, 'extract_nodes', mock_extract_nodes)
     monkeypatch.setattr(bulk_utils, 'extract_edges', mock_extract_edges)
@@ -540,7 +540,7 @@ async def test_extract_nodes_and_edges_bulk_custom_instructions_multiple_episode
                 'custom_extraction_instructions': custom_extraction_instructions,
             }
         )
-        return []
+        return [], []
 
     monkeypatch.setattr(bulk_utils, 'extract_nodes', mock_extract_nodes)
     monkeypatch.setattr(bulk_utils, 'extract_edges', mock_extract_edges)

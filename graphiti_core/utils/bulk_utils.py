@@ -158,9 +158,16 @@ async def add_nodes_and_edges_bulk_tx(
     driver: GraphDriver,
 ):
     episodes = [dict(episode) for episode in episodic_nodes]
-    for episode in episodes:
+    for i, episode in enumerate(episodes):
         episode['source'] = str(episode['source'].value)
         episode.pop('labels', None)
+        node = episodic_nodes[i]
+        episode['narrative_excerpts'] = json.dumps(node.narrative_excerpts, ensure_ascii=False)
+        episode['describes_edges'] = json.dumps(node.describes_edges, ensure_ascii=False)
+        episode['content_blocks'] = json.dumps(
+            [block.model_dump(mode='json') for block in node.content_blocks],
+            ensure_ascii=False,
+        ) if node.content_blocks else '[]'
 
     nodes = []
 
@@ -196,6 +203,7 @@ async def add_nodes_and_edges_bulk_tx(
             'target_node_uuid': edge.target_node_uuid,
             'name': edge.name,
             'fact': edge.fact,
+            'source_excerpt': edge.source_excerpt,
             'group_id': edge.group_id,
             'episodes': edge.episodes,
             'created_at': edge.created_at,
@@ -274,7 +282,7 @@ async def extract_nodes_and_edges_bulk(
         ]
     )
 
-    extracted_edges_bulk: list[list[EntityEdge]] = await semaphore_gather(
+    extracted_edges_results: list[tuple[list[EntityEdge], list[str]]] = await semaphore_gather(
         *[
             extract_edges(
                 clients,
@@ -289,6 +297,9 @@ async def extract_nodes_and_edges_bulk(
             for i, (episode, previous_episodes) in enumerate(episode_tuples)
         ]
     )
+
+    # Unpack: bulk path discards narrative excerpts for now (POC)
+    extracted_edges_bulk: list[list[EntityEdge]] = [edges for edges, _ in extracted_edges_results]
 
     return extracted_nodes_bulk, extracted_edges_bulk
 
@@ -421,7 +432,7 @@ async def dedupe_edges_bulk(
 
     # generate embeddings
     await semaphore_gather(
-        *[create_entity_edge_embeddings(embedder, edges) for edges in extracted_edges]
+        *[create_entity_edge_embeddings(embedder, edges, clients.image_embedding_map) for edges in extracted_edges]
     )
 
     # Find similar results

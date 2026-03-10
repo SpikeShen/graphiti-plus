@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 from datetime import datetime
 from time import time
+from typing import Any
 
 from pydantic import BaseModel
 from typing_extensions import LiteralString
@@ -32,11 +33,11 @@ from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.config import ModelSize
-from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
+from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.prompts import prompt_library
 from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
 from graphiti_core.prompts.extract_edges import Edge as ExtractedEdge
-from graphiti_core.prompts.extract_edges import ExtractedEdges
+from graphiti_core.prompts.extract_edges import ExtractedEdges, NarrativeExcerpt
 from graphiti_core.search.search import search
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_config_recipes import EDGE_HYBRID_SEARCH_RRF
@@ -45,6 +46,20 @@ from graphiti_core.utils.datetime_utils import ensure_utc, utc_now
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 
 logger = logging.getLogger(__name__)
+
+
+import re as _re
+
+def _pad_iso_year(date_str: str) -> str:
+    """Pad year to 4 digits for ISO format parsing.
+    
+    LLM may output dates like '169-04-15' (3-digit year) for historical dates.
+    Python's datetime.fromisoformat() requires at least 4-digit years.
+    """
+    m = _re.match(r'^(\d{1,3})(-)', date_str)
+    if m:
+        return m.group(1).zfill(4) + date_str[m.end(1):]
+    return date_str
 
 
 def build_episodic_edges(
@@ -94,7 +109,7 @@ async def extract_edges(
     group_id: str = '',
     edge_types: dict[str, type[BaseModel]] | None = None,
     custom_extraction_instructions: str | None = None,
-) -> list[EntityEdge]:
+) -> tuple[list[EntityEdge], list[NarrativeExcerpt]]:
     start = time()
 
     extract_edges_max_tokens = 16384
@@ -127,7 +142,7 @@ async def extract_edges(
     name_to_node: dict[str, EntityNode] = {node.name: node for node in nodes}
 
     # Prepare context for LLM
-    context = {
+    context: dict[str, Any] = {
         'episode_content': episode.content,
         'nodes': [{'name': node.name, 'entity_types': node.labels} for node in nodes],
         'previous_episodes': [ep.content for ep in previous_episodes],
@@ -136,14 +151,25 @@ async def extract_edges(
         'custom_extraction_instructions': custom_extraction_instructions or '',
     }
 
+    # Choose prompt based on episode type
+    if episode.source == EpisodeType.document and episode.content_blocks:
+        context['content_blocks'] = episode.content_blocks
+        prompt = prompt_library.extract_edges.edge_document(context)
+        prompt_name = 'extract_edges.edge_document'
+    else:
+        prompt = prompt_library.extract_edges.edge(context)
+        prompt_name = 'extract_edges.edge'
+
     llm_response = await llm_client.generate_response(
-        prompt_library.extract_edges.edge(context),
+        prompt,
         response_model=ExtractedEdges,
         max_tokens=extract_edges_max_tokens,
         group_id=group_id,
-        prompt_name='extract_edges.edge',
+        prompt_name=prompt_name,
     )
-    all_edges_data = ExtractedEdges(**llm_response).edges
+    extracted = ExtractedEdges(**llm_response)
+    all_edges_data = extracted.edges
+    narrative_excerpts = extracted.narrative_excerpts
 
     # Validate entity names
     edges_data: list[ExtractedEdge] = []
@@ -172,7 +198,7 @@ async def extract_edges(
     logger.debug(f'Extracted {len(edges_data)} new edges in {(end - start) * 1000:.0f} ms')
 
     if len(edges_data) == 0:
-        return []
+        return [], narrative_excerpts
 
     # Convert the extracted data into EntityEdge objects
     edges = []
@@ -201,7 +227,7 @@ async def extract_edges(
         if valid_at:
             try:
                 valid_at_datetime = ensure_utc(
-                    datetime.fromisoformat(valid_at.replace('Z', '+00:00'))
+                    datetime.fromisoformat(_pad_iso_year(valid_at).replace('Z', '+00:00'))
                 )
             except ValueError as e:
                 logger.warning(f'WARNING: Error parsing valid_at date: {e}. Input: {valid_at}')
@@ -209,7 +235,7 @@ async def extract_edges(
         if invalid_at:
             try:
                 invalid_at_datetime = ensure_utc(
-                    datetime.fromisoformat(invalid_at.replace('Z', '+00:00'))
+                    datetime.fromisoformat(_pad_iso_year(invalid_at).replace('Z', '+00:00'))
                 )
             except ValueError as e:
                 logger.warning(f'WARNING: Error parsing invalid_at date: {e}. Input: {invalid_at}')
@@ -219,6 +245,7 @@ async def extract_edges(
             name=edge_data.relation_type,
             group_id=group_id,
             fact=edge_data.fact,
+            source_excerpt=edge_data.source_excerpt,
             episodes=[episode.uuid],
             created_at=utc_now(),
             valid_at=valid_at_datetime,
@@ -231,7 +258,7 @@ async def extract_edges(
 
     logger.debug(f'Extracted edges: {[e.uuid for e in edges]}')
 
-    return edges
+    return edges, narrative_excerpts
 
 
 async def resolve_extracted_edges(
@@ -271,7 +298,7 @@ async def resolve_extracted_edges(
     driver = clients.driver
     llm_client = clients.llm_client
     embedder = clients.embedder
-    await create_entity_edge_embeddings(embedder, extracted_edges)
+    await create_entity_edge_embeddings(embedder, extracted_edges, clients.image_embedding_map)
 
     valid_edges_list: list[list[EntityEdge]] = await semaphore_gather(
         *[
@@ -415,8 +442,8 @@ async def resolve_extracted_edges(
     logger.debug(f'New edges (non-duplicates): {[e.uuid for e in new_edges]}')
 
     await semaphore_gather(
-        create_entity_edge_embeddings(embedder, resolved_edges),
-        create_entity_edge_embeddings(embedder, invalidated_edges),
+        create_entity_edge_embeddings(embedder, resolved_edges, clients.image_embedding_map),
+        create_entity_edge_embeddings(embedder, invalidated_edges, clients.image_embedding_map),
     )
 
     return resolved_edges, invalidated_edges, new_edges

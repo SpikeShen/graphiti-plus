@@ -18,6 +18,7 @@ import json
 import logging
 import typing
 from abc import abstractmethod
+from time import time
 from typing import Any, ClassVar
 
 import openai
@@ -239,6 +240,7 @@ class BaseOpenAIClient(LLMClient):
             last_error = None
             total_input_tokens = 0
             total_output_tokens = 0
+            _start_time = time()
 
             while retry_count <= self.MAX_RETRIES:
                 try:
@@ -250,6 +252,19 @@ class BaseOpenAIClient(LLMClient):
 
                     # Record token usage
                     self.token_tracker.record(prompt_name, total_input_tokens, total_output_tokens)
+
+                    # Record to S3 logger
+                    if self.s3_logger:
+                        self.s3_logger.record(
+                            operation='llm.generate',
+                            model_id=self._get_model_for_size(model_size),
+                            prompt_name=prompt_name,
+                            group_id=group_id,
+                            input_tokens=total_input_tokens,
+                            output_tokens=total_output_tokens,
+                            latency_ms=(time() - _start_time) * 1000,
+                            input_preview=messages[-1].content if messages else None,
+                        )
 
                     return response
                 except (RateLimitError, RefusalError):

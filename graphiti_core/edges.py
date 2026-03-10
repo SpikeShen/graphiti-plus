@@ -31,6 +31,8 @@ from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError
 from graphiti_core.helpers import parse_db_date
 from graphiti_core.models.edges.edge_db_queries import (
     COMMUNITY_EDGE_RETURN,
+    DESCRIBES_EDGE_RETURN,
+    DESCRIBES_EDGE_SAVE,
     EPISODIC_EDGE_RETURN,
     EPISODIC_EDGE_SAVE,
     HAS_EPISODE_EDGE_RETURN,
@@ -81,7 +83,7 @@ class Edge(BaseModel, ABC):
         else:
             await driver.execute_query(
                 """
-                MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER {uuid: $uuid}]->(m)
+                MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER|DESCRIBES {uuid: $uuid}]->(m)
                 DELETE e
                 """,
                 uuid=self.uuid,
@@ -119,7 +121,7 @@ class Edge(BaseModel, ABC):
         else:
             await driver.execute_query(
                 """
-                MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m)
+                MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER|DESCRIBES]->(m)
                 WHERE e.uuid IN $uuids
                 DELETE e
                 """,
@@ -264,6 +266,13 @@ class EntityEdge(Edge):
     name: str = Field(description='name of the edge, relation name')
     fact: str = Field(description='fact representing the edge and nodes that it connects')
     fact_embedding: list[float] | None = Field(default=None, description='embedding of the fact')
+    source_excerpt: str = Field(
+        default='',
+        description='Original text excerpt from the source that supports this fact',
+    )
+    source_excerpt_embedding: list[float] | None = Field(
+        default=None, description='embedding of the source_excerpt'
+    )
     episodes: list[str] = Field(
         default=[],
         description='list of episode ids that reference these entity edges',
@@ -342,6 +351,7 @@ class EntityEdge(Edge):
             'group_id': self.group_id,
             'fact': self.fact,
             'fact_embedding': self.fact_embedding,
+            'source_excerpt': self.source_excerpt,
             'episodes': self.episodes,
             'created_at': self.created_at,
             'expired_at': self.expired_at,
@@ -562,6 +572,91 @@ class EntityEdge(Edge):
         edges = [get_entity_edge_from_record(record, driver.provider) for record in records]
 
         return edges
+
+
+class DescribesEdge(Edge):
+    """Episode → Entity description edge.
+
+    Represents text from an episode that describes a specific entity's attributes,
+    abilities, or background, but cannot be expressed as a relationship between
+    two named entities.
+
+    source_node_uuid = episode.uuid (EpisodicNode)
+    target_node_uuid = entity.uuid (EntityNode)
+    """
+
+    fact: str = Field(
+        description='LLM-generated summary of what this excerpt describes about the entity'
+    )
+    fact_embedding: list[float] | None = Field(
+        default=None, description='embedding of the fact'
+    )
+    excerpt: str = Field(
+        description='Original text excerpt from the episode that describes the target entity'
+    )
+    excerpt_embedding: list[float] | None = Field(
+        default=None, description='embedding of the excerpt'
+    )
+
+    async def save(self, driver: GraphDriver):
+        result = await driver.execute_query(
+            DESCRIBES_EDGE_SAVE,
+            episode_uuid=self.source_node_uuid,
+            entity_uuid=self.target_node_uuid,
+            uuid=self.uuid,
+            group_id=self.group_id,
+            fact=self.fact,
+            excerpt=self.excerpt,
+            created_at=self.created_at,
+        )
+        logger.debug(f'Saved DescribesEdge to Graph: {self.uuid}')
+        return result
+
+    @classmethod
+    async def get_by_uuid(cls, driver: GraphDriver, uuid: str):
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (n:Episodic)-[e:DESCRIBES {uuid: $uuid}]->(m:Entity)
+            RETURN
+            """
+            + DESCRIBES_EDGE_RETURN,
+            uuid=uuid,
+            routing_='r',
+        )
+        edges = [get_describes_edge_from_record(record) for record in records]
+        if len(edges) == 0:
+            raise EdgeNotFoundError(uuid)
+        return edges[0]
+
+    @classmethod
+    async def get_by_uuids(cls, driver: GraphDriver, uuids: list[str]):
+        if not uuids:
+            return []
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (n:Episodic)-[e:DESCRIBES]->(m:Entity)
+            WHERE e.uuid IN $uuids
+            RETURN
+            """
+            + DESCRIBES_EDGE_RETURN,
+            uuids=uuids,
+            routing_='r',
+        )
+        return [get_describes_edge_from_record(record) for record in records]
+
+    @classmethod
+    async def get_by_entity_uuid(cls, driver: GraphDriver, entity_uuid: str):
+        """Get all DESCRIBES edges pointing to a specific entity."""
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (ep:Episodic)-[e:DESCRIBES]->(en:Entity {uuid: $entity_uuid})
+            RETURN
+            """
+            + DESCRIBES_EDGE_RETURN,
+            entity_uuid=entity_uuid,
+            routing_='r',
+        )
+        return [get_describes_edge_from_record(record) for record in records]
 
 
 class CommunityEdge(Edge):
@@ -975,6 +1070,7 @@ def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityE
         attributes.pop('expired_at', None)
         attributes.pop('valid_at', None)
         attributes.pop('invalid_at', None)
+        source_excerpt = attributes.pop('source_excerpt', '')
 
     edge = EntityEdge(
         uuid=record['uuid'],
@@ -982,6 +1078,7 @@ def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityE
         target_node_uuid=record['target_node_uuid'],
         fact=record['fact'],
         fact_embedding=record.get('fact_embedding'),
+        source_excerpt=source_excerpt if provider != GraphProvider.KUZU else record.get('source_excerpt', ''),
         name=record['name'],
         group_id=record['group_id'],
         episodes=episodes,
@@ -1025,7 +1122,25 @@ def get_next_episode_edge_from_record(record: Any) -> NextEpisodeEdge:
     )
 
 
-async def create_entity_edge_embeddings(embedder: EmbedderClient, edges: list[EntityEdge]):
+def get_describes_edge_from_record(record: Any) -> DescribesEdge:
+    return DescribesEdge(
+        uuid=record['uuid'],
+        group_id=record['group_id'],
+        source_node_uuid=record['source_node_uuid'],
+        target_node_uuid=record['target_node_uuid'],
+        fact=record.get('fact', ''),
+        excerpt=record.get('excerpt', ''),
+        created_at=parse_db_date(record['created_at']),  # type: ignore
+    )
+
+
+async def create_entity_edge_embeddings(
+    embedder: EmbedderClient,
+    edges: list[EntityEdge],
+    image_embedding_map: dict[str, list[float]] | None = None,
+):
+    from graphiti_core.nodes import extract_s3_uri_from_excerpt
+
     # filter out falsey values from edges
     filtered_edges = [edge for edge in edges if edge.fact]
 
@@ -1034,3 +1149,24 @@ async def create_entity_edge_embeddings(embedder: EmbedderClient, edges: list[En
     fact_embeddings = await embedder.create_batch([edge.fact for edge in filtered_edges])
     for edge, fact_embedding in zip(filtered_edges, fact_embeddings, strict=True):
         edge.fact_embedding = fact_embedding
+
+    # Generate source_excerpt embeddings for edges that have them
+    excerpt_edges = [edge for edge in filtered_edges if edge.source_excerpt]
+    if excerpt_edges:
+        # Split into image-referenced and text-only excerpts
+        text_edges: list[EntityEdge] = []
+        for edge in excerpt_edges:
+            s3_uri = extract_s3_uri_from_excerpt(edge.source_excerpt)
+            if s3_uri and image_embedding_map and s3_uri in image_embedding_map:
+                # Use pre-computed image embedding
+                edge.source_excerpt_embedding = image_embedding_map[s3_uri]
+            else:
+                text_edges.append(edge)
+
+        # Batch embed remaining text excerpts
+        if text_edges:
+            text_embeddings = await embedder.create_batch(
+                [edge.source_excerpt for edge in text_edges]
+            )
+            for edge, emb in zip(text_edges, text_embeddings, strict=True):
+                edge.source_excerpt_embedding = emb

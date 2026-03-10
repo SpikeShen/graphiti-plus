@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+import os
 from datetime import datetime
 from time import time
 from uuid import uuid4
@@ -30,6 +31,7 @@ from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
+    DescribesEdge,
     Edge,
     EntityEdge,
     EpisodicEdge,
@@ -58,7 +60,8 @@ from graphiti_core.nodes import (
     create_entity_node_embeddings,
 )
 from graphiti_core.search.search import SearchConfig, search
-from graphiti_core.search.search_config import DEFAULT_SEARCH_LIMIT, SearchResults
+from graphiti_core.vector_store.s3_vectors_client import S3VectorsClient
+from graphiti_core.search.search_config import DEFAULT_SEARCH_LIMIT, EdgeSearchMethod, NodeSearchMethod, SearchResults
 from graphiti_core.search.search_config_recipes import (
     COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
     EDGE_HYBRID_SEARCH_NODE_DISTANCE,
@@ -92,6 +95,7 @@ from graphiti_core.utils.maintenance.edge_operations import (
     resolve_extracted_edge,
     resolve_extracted_edges,
 )
+from graphiti_core.prompts.extract_edges import NarrativeExcerpt
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
     retrieve_episodes,
@@ -104,6 +108,11 @@ from graphiti_core.utils.maintenance.node_operations import (
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 
 logger = logging.getLogger(__name__)
+
+# Cosine similarity threshold for episode content dedup.
+# 0.95 is high enough to only catch near-identical content while allowing
+# minor formatting differences (whitespace, punctuation).
+EPISODE_DEDUP_MIN_SCORE = float(os.environ.get('EPISODE_DEDUP_MIN_SCORE', '0.95'))
 
 load_dotenv()
 
@@ -145,6 +154,8 @@ class Graphiti:
         max_coroutines: int | None = None,
         tracer: Tracer | None = None,
         trace_span_prefix: str = 'graphiti',
+        s3_vectors: S3VectorsClient | None = None,
+        s3_logger=None,
     ):
         """
         Initialize a Graphiti instance.
@@ -229,12 +240,23 @@ class Graphiti:
         # Set tracer on clients
         self.llm_client.set_tracer(self.tracer)
 
+        # S3 invocation logger (optional)
+        self.s3_logger = s3_logger
+        if s3_logger:
+            self.llm_client.set_s3_logger(s3_logger)
+            if hasattr(self.embedder, 'set_s3_logger'):
+                self.embedder.set_s3_logger(s3_logger)
+
+        # S3 Vectors client (optional)
+        self.s3_vectors = s3_vectors
+
         self.clients = GraphitiClients(
             driver=self.driver,
             llm_client=self.llm_client,
             embedder=self.embedder,
             cross_encoder=self.cross_encoder,
             tracer=self.tracer,
+            s3_vectors=self.s3_vectors,
         )
 
         # Initialize namespace API (graphiti.nodes.entity.save(), etc.)
@@ -264,6 +286,211 @@ class Graphiti:
         except Exception:
             # Silently handle telemetry errors
             pass
+
+    def _sync_nodes_to_s3_vectors(self, nodes: list[EntityNode]) -> None:
+        """Sync entity node embeddings to S3 Vectors (fire-and-forget for POC)."""
+        if self.s3_vectors is None:
+            return
+        for node in nodes:
+            if node.name_embedding:
+                self.s3_vectors.upsert_entity_vector(
+                    uuid=node.uuid,
+                    embedding=node.name_embedding,
+                    group_id=node.group_id,
+                    name=node.name,
+                    created_at_ts=node.created_at.timestamp(),
+                )
+
+    def _sync_edges_to_s3_vectors(self, edges: list[EntityEdge]) -> None:
+        """Sync entity edge embeddings to S3 Vectors (fire-and-forget for POC)."""
+        if self.s3_vectors is None:
+            return
+        for edge in edges:
+            if edge.fact_embedding:
+                self.s3_vectors.upsert_edge_vector(
+                    uuid=edge.uuid,
+                    embedding=edge.fact_embedding,
+                    group_id=edge.group_id,
+                    source_node_uuid=edge.source_node_uuid,
+                    target_node_uuid=edge.target_node_uuid,
+                    fact=edge.fact,
+                    created_at_ts=edge.created_at.timestamp(),
+                )
+            if edge.source_excerpt_embedding and edge.source_excerpt:
+                self.s3_vectors.upsert_edge_source_vector(
+                    uuid=edge.uuid,
+                    embedding=edge.source_excerpt_embedding,
+                    group_id=edge.group_id,
+                    source_excerpt=edge.source_excerpt,
+                    created_at_ts=edge.created_at.timestamp(),
+                )
+
+    def _sync_communities_to_s3_vectors(self, communities: list[CommunityNode]) -> None:
+        """Sync community node embeddings to S3 Vectors (fire-and-forget for POC)."""
+        if self.s3_vectors is None:
+            return
+        for comm in communities:
+            if comm.name_embedding:
+                self.s3_vectors.upsert_community_vector(
+                    uuid=comm.uuid,
+                    embedding=comm.name_embedding,
+                    group_id=comm.group_id,
+                    name=comm.name,
+                    created_at_ts=comm.created_at.timestamp(),
+                )
+
+    async def _sync_narratives_to_s3_vectors(
+        self,
+        excerpts: list[str],
+        episode: EpisodicNode,
+        group_id: str,
+        now: datetime,
+        image_embedding_map: dict[str, list[float]] | None = None,
+    ) -> None:
+        """Embed and sync episode narratives to S3 Vectors."""
+        import hashlib
+
+        from graphiti_core.nodes import extract_s3_uri_from_excerpt
+
+        if self.s3_vectors is None or not excerpts:
+            return
+
+        # Filter out empty excerpts
+        valid_excerpts = [e.strip() for e in excerpts if e.strip()]
+        if not valid_excerpts:
+            return
+
+        # Build embeddings: use image vectors for image-referenced excerpts
+        embeddings: list[list[float]] = []
+        text_indices: list[int] = []
+        text_items: list[str] = []
+
+        for i, excerpt in enumerate(valid_excerpts):
+            s3_uri = extract_s3_uri_from_excerpt(excerpt)
+            if s3_uri and image_embedding_map and s3_uri in image_embedding_map:
+                embeddings.append(image_embedding_map[s3_uri])
+            else:
+                embeddings.append([])  # placeholder
+                text_indices.append(i)
+                text_items.append(excerpt)
+
+        # Batch embed text excerpts
+        if text_items:
+            text_embs = await self.embedder.create_batch(text_items)
+            for idx, emb in zip(text_indices, text_embs, strict=True):
+                embeddings[idx] = emb
+
+        for excerpt, embedding in zip(valid_excerpts, embeddings, strict=True):
+            content_hash = hashlib.sha256(excerpt.encode('utf-8')).hexdigest()[:8]
+            key = f'{episode.uuid}:narrative:{content_hash}'
+            self.s3_vectors.upsert_narrative_vector(
+                key=key,
+                embedding=embedding,
+                group_id=group_id,
+                episode_uuid=episode.uuid,
+                excerpt=excerpt,
+                created_at_ts=now.timestamp(),
+            )
+
+        logger.info(
+            'Synced %d episode narratives to S3 Vectors for episode %s',
+            len(valid_excerpts),
+            episode.uuid,
+        )
+
+    async def _create_describes_edges(
+        self,
+        node_excerpts: dict[str, list[NarrativeExcerpt]],
+        resolved_nodes: list[EntityNode],
+        episode: EpisodicNode,
+        group_id: str,
+        now: datetime,
+        image_embedding_map: dict[str, list[float]] | None = None,
+    ) -> list[DescribesEdge]:
+        """Create DescribesEdge instances for entity-attributed narrative excerpts.
+
+        Returns the created edges. Excerpts whose related_entity doesn't match any
+        resolved node are returned via the demoted_excerpts list on the caller side.
+        """
+        from graphiti_core.nodes import extract_s3_uri_from_excerpt
+
+        name_to_node = {n.name: n for n in resolved_nodes}
+        edges: list[DescribesEdge] = []
+        demoted_entity_names: list[str] = []
+
+        for entity_name, ue_list in node_excerpts.items():
+            node = name_to_node.get(entity_name)
+            if node is None:
+                logger.warning(
+                    'DescribesEdge: entity "%s" not found in resolved_nodes, '
+                    'demoting %d excerpts to narratives',
+                    entity_name,
+                    len(ue_list),
+                )
+                demoted_entity_names.append(entity_name)
+                continue
+
+            for ue in ue_list:
+                edge = DescribesEdge(
+                    source_node_uuid=episode.uuid,
+                    target_node_uuid=node.uuid,
+                    group_id=group_id,
+                    fact=ue.fact or ue.excerpt,
+                    excerpt=ue.excerpt,
+                    created_at=now,
+                )
+                await edge.save(self.driver)
+                edges.append(edge)
+
+        # Batch embed fact + excerpt, sync to S3 Vectors
+        if edges and self.s3_vectors is not None:
+            fact_embeddings = await self.embedder.create_batch([e.fact for e in edges])
+
+            # For excerpt embeddings: use image vectors when excerpt references an image
+            excerpt_embeddings: list[list[float]] = []
+            text_indices: list[int] = []
+            text_excerpts: list[str] = []
+
+            for i, edge in enumerate(edges):
+                s3_uri = extract_s3_uri_from_excerpt(edge.excerpt)
+                if s3_uri and image_embedding_map and s3_uri in image_embedding_map:
+                    excerpt_embeddings.append(image_embedding_map[s3_uri])
+                else:
+                    excerpt_embeddings.append([])  # placeholder
+                    text_indices.append(i)
+                    text_excerpts.append(edge.excerpt)
+
+            # Batch embed text excerpts
+            if text_excerpts:
+                text_embs = await self.embedder.create_batch(text_excerpts)
+                for idx, emb in zip(text_indices, text_embs, strict=True):
+                    excerpt_embeddings[idx] = emb
+
+            for edge, fact_emb, excerpt_emb in zip(
+                edges, fact_embeddings, excerpt_embeddings, strict=True
+            ):
+                edge.fact_embedding = fact_emb
+                edge.excerpt_embedding = excerpt_emb
+                self.s3_vectors.upsert_describes_fact_vector(
+                    uuid=edge.uuid,
+                    embedding=fact_emb,
+                    group_id=edge.group_id,
+                    target_node_uuid=edge.target_node_uuid,
+                    fact=edge.fact,
+                    created_at_ts=edge.created_at.timestamp(),
+                )
+                self.s3_vectors.upsert_describes_excerpt_vector(
+                    uuid=edge.uuid,
+                    embedding=excerpt_emb,
+                    group_id=edge.group_id,
+                    target_node_uuid=edge.target_node_uuid,
+                    excerpt=edge.excerpt,
+                    created_at_ts=edge.created_at.timestamp(),
+                )
+
+        return edges
+
+
 
     @property
     def token_tracker(self):
@@ -339,6 +566,8 @@ class Graphiti:
                 graphiti.close()
         """
         await self.driver.close()
+        if self.s3_logger:
+            self.s3_logger.flush()
 
     async def _get_or_create_saga(self, saga_name: str, group_id: str, now: datetime) -> SagaNode:
         """
@@ -424,6 +653,12 @@ class Graphiti:
         """
         await self.driver.build_indices_and_constraints(delete_existing)
 
+        # Set up S3 Vectors bucket and indices if configured
+        if self.s3_vectors is not None:
+            if delete_existing:
+                self.s3_vectors.delete_all_indices()
+            self.s3_vectors.ensure_bucket_and_indices()
+
     async def _extract_and_resolve_nodes(
         self,
         episode: EpisodicNode,
@@ -457,18 +692,19 @@ class Graphiti:
         nodes: list[EntityNode],
         uuid_map: dict[str, str],
         custom_extraction_instructions: str | None = None,
-    ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]:
+    ) -> tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge], list[NarrativeExcerpt]]:
         """Extract edges from episode and resolve against existing graph.
 
         Returns
         -------
-        tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge]]
-            A tuple of (resolved_edges, invalidated_edges, new_edges) where:
+        tuple[list[EntityEdge], list[EntityEdge], list[EntityEdge], list[NarrativeExcerpt]]
+            A tuple of (resolved_edges, invalidated_edges, new_edges, narrative_excerpts) where:
             - resolved_edges: All edges after resolution
             - invalidated_edges: Edges invalidated by new information
             - new_edges: Only edges that are new to the graph (not duplicates)
+            - narrative_excerpts: Structured narrative excerpts with optional entity attribution
         """
-        extracted_edges = await extract_edges(
+        extracted_edges, narrative_excerpts = await extract_edges(
             self.clients,
             episode,
             extracted_nodes,
@@ -490,7 +726,7 @@ class Graphiti:
             edge_type_map,
         )
 
-        return resolved_edges, invalidated_edges, new_edges
+        return resolved_edges, invalidated_edges, new_edges, narrative_excerpts
 
     async def _process_episode_data(
         self,
@@ -803,6 +1039,7 @@ class Graphiti:
         custom_extraction_instructions: str | None = None,
         saga: str | SagaNode | None = None,
         saga_previous_episode_uuid: str | None = None,
+        content_blocks: list | None = None,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -889,6 +1126,49 @@ class Graphiti:
                 self.driver = self.driver.clone(database=group_id)
                 self.clients.driver = self.driver
 
+        # Duplicate episode guard: embed content and check S3 Vectors for near-duplicates
+        content_embedding: list[float] | None = None
+        if self.s3_vectors is not None:
+            content_embedding = await self.embedder.create(episode_body)
+            dupes = self.s3_vectors.query_episode_content_vectors(
+                content_embedding,
+                group_ids=[group_id],
+                top_k=1,
+                min_score=EPISODE_DEDUP_MIN_SCORE,
+            )
+            if dupes:
+                hit = dupes[0]
+                logger.warning(
+                    '[add_episode] SKIP duplicate: episode content is %.1f%% similar to '
+                    'existing episode %s (name=%s, group_id=%s)',
+                    hit.score * 100,
+                    hit.key,
+                    hit.metadata.get('name', '?'),
+                    group_id,
+                )
+                try:
+                    existing_episode = await EpisodicNode.get_by_uuid(self.driver, hit.key)
+                except Exception:
+                    existing_episode = EpisodicNode(
+                        uuid=hit.key,
+                        name=hit.metadata.get('name', ''),
+                        group_id=group_id,
+                        labels=[],
+                        source=EpisodeType.text,
+                        source_description='',
+                        content=hit.metadata.get('content_preview', ''),
+                        created_at=utc_now(),
+                        valid_at=reference_time,
+                    )
+                return AddEpisodeResults(
+                    episode=existing_episode,
+                    episodic_edges=[],
+                    nodes=[],
+                    edges=[],
+                    communities=[],
+                    community_edges=[],
+                )
+
         with self.tracer.start_span('add_episode') as span:
             try:
                 # Retrieve previous episodes for context
@@ -904,10 +1184,24 @@ class Graphiti:
                 )
 
                 # Get or create episode
-                episode = (
-                    await EpisodicNode.get_by_uuid(self.driver, uuid)
-                    if uuid is not None
-                    else EpisodicNode(
+                if uuid is not None:
+                    try:
+                        episode = await EpisodicNode.get_by_uuid(self.driver, uuid)
+                    except NodeNotFoundError:
+                        episode = EpisodicNode(
+                            uuid=uuid,
+                            name=name,
+                            group_id=group_id,
+                            labels=[],
+                            source=source,
+                            content=episode_body,
+                            source_description=source_description,
+                            created_at=now,
+                            valid_at=reference_time,
+                            content_blocks=content_blocks or [],
+                        )
+                else:
+                    episode = EpisodicNode(
                         name=name,
                         group_id=group_id,
                         labels=[],
@@ -916,8 +1210,8 @@ class Graphiti:
                         source_description=source_description,
                         created_at=now,
                         valid_at=reference_time,
+                        content_blocks=content_blocks or [],
                     )
-                )
 
                 # Create default edge type map
                 edge_type_map_default = (
@@ -926,7 +1220,9 @@ class Graphiti:
                     else {('Entity', 'Entity'): []}
                 )
 
-                # Extract and resolve nodes
+                # --- Phase 1: Extract nodes ---
+                t0 = time()
+                logger.info('[add_episode] Phase 1/6: Extracting nodes...')
                 extracted_nodes = await extract_nodes(
                     self.clients,
                     episode,
@@ -935,7 +1231,11 @@ class Graphiti:
                     excluded_entity_types,
                     custom_extraction_instructions,
                 )
+                logger.info('[add_episode] Phase 1/6: Extracted %d nodes (%.1fs)', len(extracted_nodes), time() - t0)
 
+                # --- Phase 2: Resolve (dedupe) nodes ---
+                t0 = time()
+                logger.info('[add_episode] Phase 2/6: Resolving nodes...')
                 nodes, uuid_map, _ = await resolve_extracted_nodes(
                     self.clients,
                     extracted_nodes,
@@ -943,12 +1243,16 @@ class Graphiti:
                     previous_episodes,
                     entity_types,
                 )
+                logger.info('[add_episode] Phase 2/6: Resolved to %d nodes (%.1fs)', len(nodes), time() - t0)
 
-                # Extract and resolve edges in parallel with attribute extraction
+                # --- Phase 3: Extract and resolve edges ---
+                t0 = time()
+                logger.info('[add_episode] Phase 3/6: Extracting & resolving edges...')
                 (
                     resolved_edges,
                     invalidated_edges,
                     new_edges,
+                    narrative_excerpts,
                 ) = await self._extract_and_resolve_edges(
                     episode,
                     extracted_nodes,
@@ -960,11 +1264,17 @@ class Graphiti:
                     uuid_map,
                     custom_extraction_instructions,
                 )
-
                 entity_edges = resolved_edges + invalidated_edges
+                logger.info(
+                    '[add_episode] Phase 3/6: %d resolved, %d invalidated, %d new edges, '
+                    '%d episode narratives (%.1fs)',
+                    len(resolved_edges), len(invalidated_edges), len(new_edges),
+                    len(narrative_excerpts), time() - t0,
+                )
 
-                # Extract node attributes - only pass new edges for summary generation
-                # to avoid duplicating facts that already exist in the graph
+                # --- Phase 4: Extract node attributes ---
+                t0 = time()
+                logger.info('[add_episode] Phase 4/6: Extracting node attributes...')
                 hydrated_nodes = await extract_attributes_from_nodes(
                     self.clients,
                     nodes,
@@ -973,8 +1283,11 @@ class Graphiti:
                     entity_types,
                     edges=new_edges,
                 )
+                logger.info('[add_episode] Phase 4/6: Hydrated %d nodes (%.1fs)', len(hydrated_nodes), time() - t0)
 
-                # Process and save episode data (including saga association if provided)
+                # --- Phase 5: Save to graph ---
+                t0 = time()
+                logger.info('[add_episode] Phase 5/6: Saving to graph...')
                 episodic_edges, episode = await self._process_episode_data(
                     episode,
                     hydrated_nodes,
@@ -984,18 +1297,88 @@ class Graphiti:
                     saga,
                     saga_previous_episode_uuid,
                 )
+                logger.info('[add_episode] Phase 5/6: Saved (%d episodic edges) (%.1fs)', len(episodic_edges), time() - t0)
+
+                # --- Phase 6: Sync to S3 Vectors ---
+                t0 = time()
+                logger.info('[add_episode] Phase 6/6: Syncing to S3 Vectors...')
+                self._sync_nodes_to_s3_vectors(hydrated_nodes)
+                self._sync_edges_to_s3_vectors(entity_edges)
+
+                # Split narrative excerpts by entity attribution
+                node_excerpts: dict[str, list[NarrativeExcerpt]] = {}
+                pure_narratives: list[str] = []
+                describes_edges: list[DescribesEdge] = []
+
+                for ue in narrative_excerpts:
+                    if isinstance(ue, NarrativeExcerpt):
+                        if ue.related_entity:
+                            node_excerpts.setdefault(ue.related_entity, []).append(ue)
+                        else:
+                            pure_narratives.append(ue.excerpt)
+                    else:
+                        # Fallback for plain strings (legacy compatibility)
+                        pure_narratives.append(str(ue))
+
+                # Create DescribesEdge for entity-attributed excerpts
+                if node_excerpts:
+                    describes_edges = await self._create_describes_edges(
+                        node_excerpts, nodes, episode, group_id, now,
+                        image_embedding_map=self.clients.image_embedding_map,
+                    )
+                    # Demoted excerpts (entity not found) go back to narratives
+                    matched_entities = {n.name for n in nodes}
+                    for entity_name, ue_list in node_excerpts.items():
+                        if entity_name not in matched_entities:
+                            pure_narratives.extend(ue.excerpt for ue in ue_list)
+
+                episode.describes_edges = [e.uuid for e in describes_edges]
+
+                # Sync episode narratives (no entity attribution)
+                if pure_narratives:
+                    await self._sync_narratives_to_s3_vectors(
+                        pure_narratives, episode, group_id, now,
+                        image_embedding_map=self.clients.image_embedding_map,
+                    )
+                episode.narrative_excerpts = pure_narratives
+                await episode.save(self.driver)
+
+                # Sync episode content embedding for future dedup detection
+                if self.s3_vectors is not None:
+                    if content_embedding is None:
+                        content_embedding = await self.embedder.create(episode_body)
+                    self.s3_vectors.upsert_episode_content_vector(
+                        uuid=episode.uuid,
+                        embedding=content_embedding,
+                        group_id=group_id,
+                        name=name,
+                        content_preview=episode_body,
+                        created_at_ts=now.timestamp(),
+                    )
+
+                logger.info(
+                    '[add_episode] Phase 6/6: Synced %d nodes, %d edges, %d describes edges, '
+                    '%d episode narratives (%.1fs)',
+                    len(hydrated_nodes), len(entity_edges), len(describes_edges),
+                    len(pure_narratives), time() - t0,
+                )
 
                 # Update communities if requested
                 communities = []
                 community_edges = []
                 if update_communities:
-                    communities, community_edges = await semaphore_gather(
+                    community_results = await semaphore_gather(
                         *[
                             update_community(self.driver, self.llm_client, self.embedder, node)
                             for node in nodes
                         ],
                         max_coroutines=self.max_coroutines,
                     )
+                    for comm_nodes, comm_edges in community_results:
+                        communities.extend(comm_nodes)
+                        community_edges.extend(comm_edges)
+                    # Sync community embeddings to S3 Vectors
+                    self._sync_communities_to_s3_vectors(communities)
 
                 end = time()
 
@@ -1033,6 +1416,161 @@ class Graphiti:
                 span.set_status('error', str(e))
                 span.record_exception(e)
                 raise e
+
+    async def add_document_episode(
+        self,
+        name: str,
+        file_path: str | None = None,
+        content_blocks: list | None = None,
+        source_description: str = '',
+        reference_time: datetime | None = None,
+        group_id: str | None = None,
+        uuid: str | None = None,
+        update_communities: bool = False,
+        entity_types: dict[str, type[BaseModel]] | None = None,
+        excluded_entity_types: list[str] | None = None,
+        custom_extraction_instructions: str | None = None,
+        saga: str | SagaNode | None = None,
+        saga_previous_episode_uuid: str | None = None,
+    ) -> AddEpisodeResults:
+        """Process a document (possibly multimodal) and update the graph.
+
+        Orchestrates: parse → image embedding → upload to S3 →
+        generate descriptions → build content text → delegate to add_episode().
+
+        Two input modes (pick one):
+        1. file_path: document file, auto-parsed via DocumentParserRegistry
+        2. content_blocks: pre-parsed ContentBlock list (skip parsing)
+        """
+        from graphiti_core.nodes import (
+            ContentBlock as CB,
+            ContentBlockType,
+            build_content_from_blocks,
+            build_image_embedding_map,
+        )
+        from graphiti_core.preprocessing import (
+            MultimodalAssetStorage,
+            default_registry,
+            generate_image_descriptions,
+        )
+
+        if reference_time is None:
+            reference_time = utc_now()
+
+        episode_uuid = uuid or str(uuid4())
+
+        # Resolve group_id early (needed for S3 key prefix)
+        if group_id is None:
+            group_id = get_default_group_id(self.driver.provider)
+
+        # --- Step 1: Parse document (if file_path provided) ---
+        if file_path is not None and content_blocks is None:
+            parser = default_registry.get_parser(file_path)
+            if parser is None:
+                raise ValueError(
+                    f'No parser registered for file: {file_path}. '
+                    f'Provide content_blocks directly or register a parser.'
+                )
+            content_blocks = await parser.parse(file_path)
+            logger.info(
+                '[add_document_episode] Parsed %d blocks from %s',
+                len(content_blocks), file_path,
+            )
+
+        if not content_blocks:
+            raise ValueError('Either file_path or non-empty content_blocks is required')
+
+        # --- Step 2: Generate image embeddings (before S3 upload clears _raw_bytes) ---
+        image_blocks = [
+            b for b in content_blocks
+            if b.block_type == ContentBlockType.image and b._raw_bytes is not None
+        ]
+        if image_blocks:
+            fmt_map = {
+                'image/jpeg': 'jpeg', 'image/jpg': 'jpeg',
+                'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp',
+            }
+            for block in image_blocks:
+                try:
+                    img_fmt = fmt_map.get(block.mime_type or '', 'jpeg')
+                    block._embedding = await self.embedder.create_image(
+                        block._raw_bytes, img_fmt,
+                    )
+                    block.embedding_generated = True
+                except Exception as e:
+                    logger.warning(
+                        '[add_document_episode] Image embedding failed for block %d: %s',
+                        block.index, e,
+                    )
+            logger.info(
+                '[add_document_episode] Generated embeddings for %d/%d image blocks',
+                sum(1 for b in image_blocks if b._embedding), len(image_blocks),
+            )
+
+        # --- Step 3: Upload binary assets to S3 (fills s3_uri, keeps _raw_bytes for LLM extraction) ---
+        has_binary = any(
+            getattr(b, '_raw_bytes', None) is not None and b.is_binary
+            for b in content_blocks
+        )
+        if has_binary:
+            try:
+                storage = MultimodalAssetStorage()
+                content_blocks = await storage.upload_blocks(
+                    content_blocks, group_id, episode_uuid,
+                    clear_raw_bytes=False,  # Keep _raw_bytes for vision LLM extraction (13.16)
+                )
+                logger.info('[add_document_episode] Uploaded binary assets to S3')
+            except Exception as e:
+                logger.warning(
+                    '[add_document_episode] S3 upload failed (continuing without): %s', e,
+                )
+
+        # --- Step 4: Generate image descriptions via vision LLM ---
+        try:
+            content_blocks = await generate_image_descriptions(
+                self.llm_client, content_blocks, group_id,
+            )
+        except Exception as e:
+            logger.warning(
+                '[add_document_episode] Image description generation failed: %s', e,
+            )
+
+        # --- Step 5: Build content text representation ---
+        content = build_content_from_blocks(content_blocks)
+
+        # --- Step 6: Set image embedding map on clients for edge embedding ---
+        img_map = build_image_embedding_map(content_blocks)
+        if img_map:
+            self.clients.image_embedding_map = img_map
+            logger.info(
+                '[add_document_episode] Image embedding map: %d entries', len(img_map),
+            )
+
+        # --- Step 7: Delegate to add_episode ---
+        try:
+            return await self.add_episode(
+                name=name,
+                episode_body=content,
+                source_description=source_description or f'document: {file_path or "pre-parsed"}',
+                reference_time=reference_time,
+                source=EpisodeType.document,
+                group_id=group_id,
+                uuid=episode_uuid,
+                update_communities=update_communities,
+                entity_types=entity_types,
+                excluded_entity_types=excluded_entity_types,
+                custom_extraction_instructions=custom_extraction_instructions,
+                saga=saga,
+                saga_previous_episode_uuid=saga_previous_episode_uuid,
+                content_blocks=content_blocks,
+            )
+        finally:
+            # Clear transient image embedding map
+            self.clients.image_embedding_map = None
+            # Clear _raw_bytes to free memory (delayed from S3 upload for vision LLM, see 13.16)
+            if content_blocks:
+                for block in content_blocks:
+                    block._raw_bytes = None
 
     async def add_episode_bulk(
         self,
@@ -1213,6 +1751,10 @@ class Graphiti:
                     self.embedder,
                 )
 
+                # Sync embeddings to S3 Vectors
+                self._sync_nodes_to_s3_vectors(final_hydrated_nodes)
+                self._sync_edges_to_s3_vectors(resolved_edges + invalidated_edges)
+
                 # Handle saga association if provided
                 if saga is not None:
                     # Get or create saga node based on input type
@@ -1326,6 +1868,9 @@ class Graphiti:
             max_coroutines=self.max_coroutines,
         )
 
+        # Sync community embeddings to S3 Vectors
+        self._sync_communities_to_s3_vectors(community_nodes)
+
         return community_nodes, community_edges
 
     @handle_multiple_group_ids
@@ -1337,6 +1882,7 @@ class Graphiti:
         num_results=DEFAULT_SEARCH_LIMIT,
         search_filter: SearchFilters | None = None,
         driver: GraphDriver | None = None,
+        deep_search: bool = False,
     ) -> list[EntityEdge]:
         """
         Perform a hybrid search on the knowledge graph.
@@ -1357,6 +1903,9 @@ class Graphiti:
             The graph partitions to return data from.
         num_results : int, optional
             The maximum number of results to return. Defaults to 10.
+        deep_search : bool, optional
+            If True, enables deep search mode which adds source_excerpt similarity
+            search and doubles the result limit. Defaults to False.
 
         Returns
         -------
@@ -1371,22 +1920,41 @@ class Graphiti:
         The search is performed using the current date and time as the reference
         point for temporal relevance.
         """
-        search_config = (
-            EDGE_HYBRID_SEARCH_RRF if center_node_uuid is None else EDGE_HYBRID_SEARCH_NODE_DISTANCE
-        )
-        search_config.limit = num_results
-
-        edges = (
-            await search(
-                self.clients,
-                query,
-                group_ids,
-                search_config,
-                search_filter if search_filter is not None else SearchFilters(),
-                driver=driver,
-                center_node_uuid=center_node_uuid,
+        if deep_search:
+            if center_node_uuid is not None:
+                search_config = EDGE_HYBRID_SEARCH_NODE_DISTANCE.model_copy(
+                    update={'limit': num_results * 2}
+                )
+            else:
+                search_config = EDGE_HYBRID_SEARCH_RRF.model_copy(
+                    update={'limit': num_results * 2}
+                )
+        elif center_node_uuid is not None:
+            search_config = EDGE_HYBRID_SEARCH_NODE_DISTANCE.model_copy(
+                update={'limit': num_results}
             )
-        ).edges
+        else:
+            search_config = EDGE_HYBRID_SEARCH_RRF.model_copy(update={'limit': num_results})
+
+        search_results = await self.search_(
+            query=query,
+            config=search_config,
+            group_ids=group_ids,
+            center_node_uuid=center_node_uuid,
+            search_filter=search_filter,
+            driver=driver,
+            deep_search=deep_search,
+        )
+
+        edges = search_results.edges
+
+        # Log episode narratives if present (deep search mode)
+        if search_results.narrative_excerpts:
+            logger.info(
+                'Deep search found %d episode narratives', len(search_results.narrative_excerpts)
+            )
+            for ue in search_results.narrative_excerpts:
+                logger.info('  [narrative] score=%.3f excerpt=%s', ue.get('score', 0), ue.get('excerpt', ''))
 
         return edges
 
@@ -1408,19 +1976,46 @@ class Graphiti:
     async def search_(
         self,
         query: str,
+        query_image: bytes | None = None,
+        query_image_format: str = 'jpeg',
         config: SearchConfig = COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
         group_ids: list[str] | None = None,
         center_node_uuid: str | None = None,
         bfs_origin_node_uuids: list[str] | None = None,
         search_filter: SearchFilters | None = None,
         driver: GraphDriver | None = None,
+        deep_search: bool = False,
     ) -> SearchResults:
         """search_ (replaces _search) is our advanced search method that returns Graph objects (nodes and edges) rather
         than a list of facts. This endpoint allows the end user to utilize more advanced features such as filters and
         different search and reranker methodologies across different layers in the graph.
 
+        Parameters
+        ----------
+        query_image : bytes | None, optional
+            Image bytes for cross-modal search. When provided, the image is
+            embedded via the embedder's create_image() method and used as the
+            search vector. If both query and query_image are provided, the
+            image embedding is used (text query is still used for BM25/fulltext).
+        query_image_format : str, optional
+            Image format (jpeg, png, etc.). Defaults to 'jpeg'.
+        deep_search : bool, optional
+            If True, automatically appends source_similarity to all configured
+            search objects (edge_config, node_config), enabling original-text
+            tracing via DescribesEdge and EntityEdge source_excerpt vectors.
+            Defaults to False.
+
         For different config recipes refer to search/search_config_recipes.
         """
+        if deep_search:
+            config = self._apply_deep_search(config)
+
+        # Compute image embedding for cross-modal search
+        query_vector: list[float] | None = None
+        if query_image is not None:
+            query_vector = await self.embedder.create_image(
+                query_image, query_image_format,
+            )
 
         return await search(
             self.clients,
@@ -1430,8 +2025,28 @@ class Graphiti:
             search_filter if search_filter is not None else SearchFilters(),
             center_node_uuid,
             bfs_origin_node_uuids,
+            query_vector=query_vector,
             driver=driver,
         )
+
+    @staticmethod
+    def _apply_deep_search(config: SearchConfig) -> SearchConfig:
+        """Append source_similarity to already-configured search objects.
+
+        Only modifies search objects that are already present in the config.
+        Does not enable search objects that the user hasn't configured.
+        """
+        config = config.model_copy(deep=True)
+
+        if config.edge_config is not None:
+            if EdgeSearchMethod.source_similarity not in config.edge_config.search_methods:
+                config.edge_config.search_methods.append(EdgeSearchMethod.source_similarity)
+
+        if config.node_config is not None:
+            if NodeSearchMethod.source_similarity not in config.node_config.search_methods:
+                config.node_config.search_methods.append(NodeSearchMethod.source_similarity)
+
+        return config
 
     async def get_nodes_and_edges_by_episode(self, episode_uuids: list[str]) -> SearchResults:
         episodes = await EpisodicNode.get_by_uuids(self.driver, episode_uuids)
@@ -1565,6 +2180,11 @@ class Graphiti:
         await create_entity_node_embeddings(self.embedder, nodes)
 
         await add_nodes_and_edges_bulk(self.driver, [], [], nodes, edges, self.embedder)
+
+        # Sync embeddings to S3 Vectors
+        self._sync_nodes_to_s3_vectors(nodes)
+        self._sync_edges_to_s3_vectors(edges)
+
         return AddTripletResults(edges=edges, nodes=nodes)
 
     async def remove_episode(self, episode_uuid: str):
@@ -1594,5 +2214,16 @@ class Graphiti:
 
         await Edge.delete_by_uuids(self.driver, [edge.uuid for edge in edges_to_delete])
         await Node.delete_by_uuids(self.driver, [node.uuid for node in nodes_to_delete])
+
+        # Delete from S3 Vectors
+        if self.s3_vectors is not None:
+            edge_uuids = [e.uuid for e in edges_to_delete]
+            node_uuids = [n.uuid for n in nodes_to_delete]
+            if edge_uuids:
+                self.s3_vectors.delete_edge_vectors(edge_uuids)
+            if node_uuids:
+                self.s3_vectors.delete_entity_vectors(node_uuids)
+            # Delete episode content vector (dedup index)
+            self.s3_vectors.delete_episode_content_vectors([episode.uuid])
 
         await episode.delete(self.driver)

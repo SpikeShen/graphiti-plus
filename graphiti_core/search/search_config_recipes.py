@@ -221,3 +221,17 @@ COMMUNITY_HYBRID_SEARCH_CROSS_ENCODER = SearchConfig(
     ),
     limit=3,
 )
+
+# DEPRECATED: Use deep_search=True parameter on search_() instead.
+# Kept for backward compatibility with existing code references.
+# performs a deep hybrid search over edges with rrf reranking (fact + BM25 + source_excerpt)
+EDGE_DEEP_SEARCH_RRF = SearchConfig(
+    edge_config=EdgeSearchConfig(
+        search_methods=[
+            EdgeSearchMethod.bm25,
+            EdgeSearchMethod.cosine_similarity,
+            EdgeSearchMethod.source_similarity,
+        ],
+        reranker=EdgeReranker.rrf,
+    )
+)

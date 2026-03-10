@@ -43,7 +43,9 @@ from graphiti_core.search.search_config import (
     SearchResults,
 )
 from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.vector_store.s3_vectors_client import S3VectorsClient
 from graphiti_core.search.search_utils import (
+    DEFAULT_MIN_SCORE,
     community_fulltext_search,
     community_similarity_search,
     edge_bfs_search,
@@ -60,6 +62,12 @@ from graphiti_core.search.search_utils import (
     node_fulltext_search,
     node_similarity_search,
     rrf,
+    s3_vectors_edge_similarity_search,
+    s3_vectors_node_similarity_search,
+    s3_vectors_node_source_similarity_search,
+    s3_vectors_community_similarity_search,
+    s3_vectors_edge_source_similarity_search,
+    s3_vectors_narrative_search,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,17 +89,22 @@ async def search(
     driver = driver or clients.driver
     embedder = clients.embedder
     cross_encoder = clients.cross_encoder
+    s3_vectors = clients.s3_vectors
 
-    if query.strip() == '':
+    if query.strip() == '' and query_vector is None:
         return SearchResults()
 
     if (
         config.edge_config
         and EdgeSearchMethod.cosine_similarity in config.edge_config.search_methods
         or config.edge_config
+        and EdgeSearchMethod.source_similarity in config.edge_config.search_methods
+        or config.edge_config
         and EdgeReranker.mmr == config.edge_config.reranker
         or config.node_config
         and NodeSearchMethod.cosine_similarity in config.node_config.search_methods
+        or config.node_config
+        and NodeSearchMethod.source_similarity in config.node_config.search_methods
         or config.node_config
         and NodeReranker.mmr == config.node_config.reranker
         or (
@@ -128,6 +141,7 @@ async def search(
             bfs_origin_node_uuids,
             config.limit,
             config.reranker_min_score,
+            s3_vectors=s3_vectors,
         ),
         node_search(
             driver,
@@ -141,6 +155,7 @@ async def search(
             bfs_origin_node_uuids,
             config.limit,
             config.reranker_min_score,
+            s3_vectors=s3_vectors,
         ),
         episode_search(
             driver,
@@ -162,6 +177,7 @@ async def search(
             config.community_config,
             config.limit,
             config.reranker_min_score,
+            s3_vectors=s3_vectors,
         ),
     )
 
@@ -175,6 +191,30 @@ async def search(
         communities=communities,
         community_reranker_scores=community_reranker_scores,
     )
+
+    # Search episode narratives in deep search mode (when source_similarity is enabled)
+    has_edge_source = (
+        config.edge_config
+        and EdgeSearchMethod.source_similarity in config.edge_config.search_methods
+    )
+    has_node_source = (
+        config.node_config
+        and NodeSearchMethod.source_similarity in config.node_config.search_methods
+    )
+    if s3_vectors is not None and (has_edge_source or has_node_source):
+        sim_min = (
+            config.edge_config.sim_min_score
+            if config.edge_config
+            else (config.node_config.sim_min_score if config.node_config else DEFAULT_MIN_SCORE)
+        )
+        uncovered = await s3_vectors_narrative_search(
+            s3_vectors,
+            search_vector,
+            group_ids,
+            limit=config.limit,
+            min_score=sim_min,
+        )
+        results.narrative_excerpts = uncovered
 
     latency = (time() - start) * 1000
 
@@ -195,6 +235,7 @@ async def edge_search(
     bfs_origin_node_uuids: list[str] | None = None,
     limit=DEFAULT_SEARCH_LIMIT,
     reranker_min_score: float = 0,
+    s3_vectors: S3VectorsClient | None = None,
 ) -> tuple[list[EntityEdge], list[float]]:
     if config is None:
         return [], []
@@ -206,18 +247,31 @@ async def edge_search(
             edge_fulltext_search(driver, query, search_filter, group_ids, 2 * limit)
         )
     if EdgeSearchMethod.cosine_similarity in config.search_methods:
-        search_tasks.append(
-            edge_similarity_search(
-                driver,
-                query_vector,
-                None,
-                None,
-                search_filter,
-                group_ids,
-                2 * limit,
-                config.sim_min_score,
+        if s3_vectors is not None:
+            search_tasks.append(
+                s3_vectors_edge_similarity_search(
+                    s3_vectors,
+                    driver,
+                    query_vector,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
+                )
             )
-        )
+        else:
+            search_tasks.append(
+                edge_similarity_search(
+                    driver,
+                    query_vector,
+                    None,
+                    None,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
+                )
+            )
     if EdgeSearchMethod.bfs in config.search_methods:
         search_tasks.append(
             edge_bfs_search(
@@ -229,6 +283,19 @@ async def edge_search(
                 2 * limit,
             )
         )
+    if EdgeSearchMethod.source_similarity in config.search_methods:
+        if s3_vectors is not None:
+            search_tasks.append(
+                s3_vectors_edge_source_similarity_search(
+                    s3_vectors,
+                    driver,
+                    query_vector,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
+                )
+            )
 
     # Execute only the configured search methods
     search_results: list[list[EntityEdge]] = []
@@ -318,6 +385,7 @@ async def node_search(
     bfs_origin_node_uuids: list[str] | None = None,
     limit=DEFAULT_SEARCH_LIMIT,
     reranker_min_score: float = 0,
+    s3_vectors: S3VectorsClient | None = None,
 ) -> tuple[list[EntityNode], list[float]]:
     if config is None:
         return [], []
@@ -329,16 +397,29 @@ async def node_search(
             node_fulltext_search(driver, query, search_filter, group_ids, 2 * limit)
         )
     if NodeSearchMethod.cosine_similarity in config.search_methods:
-        search_tasks.append(
-            node_similarity_search(
-                driver,
-                query_vector,
-                search_filter,
-                group_ids,
-                2 * limit,
-                config.sim_min_score,
+        if s3_vectors is not None:
+            search_tasks.append(
+                s3_vectors_node_similarity_search(
+                    s3_vectors,
+                    driver,
+                    query_vector,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
+                )
             )
-        )
+        else:
+            search_tasks.append(
+                node_similarity_search(
+                    driver,
+                    query_vector,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
+                )
+            )
     if NodeSearchMethod.bfs in config.search_methods:
         search_tasks.append(
             node_bfs_search(
@@ -350,6 +431,19 @@ async def node_search(
                 2 * limit,
             )
         )
+    if NodeSearchMethod.source_similarity in config.search_methods:
+        if s3_vectors is not None:
+            search_tasks.append(
+                s3_vectors_node_source_similarity_search(
+                    s3_vectors,
+                    driver,
+                    query_vector,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
+                )
+            )
 
     # Execute only the configured search methods
     search_results: list[list[EntityNode]] = []
@@ -474,19 +568,29 @@ async def community_search(
     config: CommunitySearchConfig | None,
     limit=DEFAULT_SEARCH_LIMIT,
     reranker_min_score: float = 0,
+    s3_vectors: S3VectorsClient | None = None,
 ) -> tuple[list[CommunityNode], list[float]]:
     if config is None:
         return [], []
 
-    search_results: list[list[CommunityNode]] = list(
-        await semaphore_gather(
-            *[
-                community_fulltext_search(driver, query, group_ids, 2 * limit),
-                community_similarity_search(
-                    driver, query_vector, group_ids, 2 * limit, config.sim_min_score
-                ),
-            ]
+    search_tasks = [
+        community_fulltext_search(driver, query, group_ids, 2 * limit),
+    ]
+    if s3_vectors is not None:
+        search_tasks.append(
+            s3_vectors_community_similarity_search(
+                s3_vectors, driver, query_vector, group_ids, 2 * limit, config.sim_min_score
+            )
         )
+    else:
+        search_tasks.append(
+            community_similarity_search(
+                driver, query_vector, group_ids, 2 * limit, config.sim_min_score
+            )
+        )
+
+    search_results: list[list[CommunityNode]] = list(
+        await semaphore_gather(*search_tasks)
     )
 
     search_result_uuids = [[community.uuid for community in result] for result in search_results]

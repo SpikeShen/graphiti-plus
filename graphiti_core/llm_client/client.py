@@ -82,6 +82,7 @@ class LLMClient(ABC):
         self.cache_dir = None
         self.tracer: Tracer = NoOpTracer()
         self.token_tracker: TokenUsageTracker = TokenUsageTracker()
+        self.s3_logger = None  # Optional S3InvocationLogger
 
         # Only create the cache directory if caching is enabled
         if self.cache_enabled:
@@ -90,16 +91,31 @@ class LLMClient(ABC):
     def set_tracer(self, tracer: Tracer) -> None:
         """Set the tracer for this LLM client."""
         self.tracer = tracer
+    def set_s3_logger(self, s3_logger) -> None:
+        """Set the S3 invocation logger for this LLM client."""
+        self.s3_logger = s3_logger
 
-    def _clean_input(self, input: str) -> str:
+    def _clean_input(self, input: str | list) -> str | list:
         """Clean input string of invalid unicode and control characters.
 
         Args:
-            input: Raw input string to be cleaned
+            input: Raw input string or multimodal content list to be cleaned
 
         Returns:
-            Cleaned string safe for LLM processing
+            Cleaned string or list safe for LLM processing
         """
+        if isinstance(input, list):
+            # Multimodal content array — clean text parts only
+            cleaned_parts = []
+            for part in input:
+                if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str):
+                    cleaned_part = dict(part)
+                    cleaned_part['text'] = self._clean_input(cleaned_part['text'])
+                    cleaned_parts.append(cleaned_part)
+                else:
+                    cleaned_parts.append(part)
+            return cleaned_parts
+
         # Clean any invalid Unicode
         cleaned = input.encode('utf-8', errors='ignore').decode('utf-8')
 
@@ -166,14 +182,23 @@ class LLMClient(ABC):
 
         if response_model is not None:
             serialized_model = json.dumps(response_model.model_json_schema())
-            messages[
-                -1
-            ].content += (
-                f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
-            )
+            if isinstance(messages[-1].content, str):
+                messages[-1].content += (
+                    f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
+                )
+            else:
+                # Multimodal content — append as a text part
+                messages[-1].content.append({
+                    'type': 'text',
+                    'text': f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}',
+                })
 
         # Add multilingual extraction instructions
-        messages[0].content += get_extraction_language_instruction(group_id)
+        lang_instruction = get_extraction_language_instruction(group_id)
+        if isinstance(messages[0].content, str):
+            messages[0].content += lang_instruction
+        else:
+            messages[0].content.append({'type': 'text', 'text': lang_instruction})
 
         for message in messages:
             message.content = self._clean_input(message.content)

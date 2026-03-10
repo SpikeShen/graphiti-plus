@@ -76,7 +76,7 @@ async def extract_nodes(
     entity_types_context = _build_entity_types_context(entity_types)
 
     # Build base context
-    context = {
+    context: dict[str, Any] = {
         'episode_content': episode.content,
         'episode_timestamp': episode.valid_at.isoformat(),
         'previous_episodes': [ep.content for ep in previous_episodes],
@@ -84,6 +84,10 @@ async def extract_nodes(
         'entity_types': entity_types_context,
         'source_description': episode.source_description,
     }
+
+    # Pass content_blocks for document-type episodes (multimodal prompt)
+    if episode.source == EpisodeType.document and episode.content_blocks:
+        context['content_blocks'] = episode.content_blocks
 
     # Extract entities
     extracted_entities = await _extract_nodes_single(llm_client, episode, context)
@@ -157,6 +161,9 @@ async def _call_extraction_llm(
     elif episode.source == EpisodeType.json:
         prompt = prompt_library.extract_nodes.extract_json(context)
         prompt_name = 'extract_nodes.extract_json'
+    elif episode.source == EpisodeType.document:
+        prompt = prompt_library.extract_nodes.extract_document(context)
+        prompt_name = 'extract_nodes.extract_document'
     else:
         # Fallback to text extraction
         prompt = prompt_library.extract_nodes.extract_text(context)

@@ -15,14 +15,14 @@ limitations under the License.
 """
 
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, Protocol, Union
 
 from pydantic import BaseModel
 
 
 class Message(BaseModel):
     role: str
-    content: str
+    content: Union[str, list[dict[str, Any]]]
 
 
 class PromptVersion(Protocol):

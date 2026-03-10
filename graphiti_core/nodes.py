@@ -23,7 +23,7 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import (
@@ -74,6 +74,7 @@ class EpisodeType(Enum):
     message = 'message'
     json = 'json'
     text = 'text'
+    document = 'document'  # 结构化文档（Word, PDF, PPT 等，可能包含多模态内容）
 
     @staticmethod
     def from_str(episode_type: str):
@@ -83,8 +84,193 @@ class EpisodeType(Enum):
             return EpisodeType.json
         if episode_type == 'text':
             return EpisodeType.text
+        if episode_type == 'document':
+            return EpisodeType.document
         logger.error(f'Episode type: {episode_type} not implemented')
         raise NotImplementedError
+
+
+class ContentBlockType(Enum):
+    """内容块类型 — 按内容的模态（modality）分类。
+
+    语义角色（标题、段落、脚注等）通过 SemanticRole 表达，与模态正交。
+    """
+
+    # 当前实现
+    text = 'text'
+    image = 'image'
+    table = 'table'
+
+    # 预留扩展
+    audio = 'audio'
+    video = 'video'
+    code = 'code'
+    formula = 'formula'
+    chart = 'chart'
+    slide = 'slide'
+
+    @staticmethod
+    def from_str(block_type: str) -> 'ContentBlockType':
+        try:
+            return ContentBlockType(block_type)
+        except ValueError:
+            return ContentBlockType.text
+
+
+class SemanticRole(Enum):
+    """内容块的语义角色（可选），与 ContentBlockType 正交。"""
+
+    body = 'body'
+    title = 'title'
+    section_header = 'section_header'
+    caption = 'caption'
+    footnote = 'footnote'
+    header = 'header'
+    footer = 'footer'
+    list_item = 'list_item'
+    abstract = 'abstract'
+
+
+class ContentBlock(BaseModel):
+    """文档中一个有序内容块。"""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    index: int = Field(description='块在文档中的顺序位置，从 0 开始')
+    block_type: ContentBlockType = Field(description='内容块的模态类型')
+
+    # 核心内容
+    text: str | None = Field(default=None, description='文本内容')
+    s3_uri: str | None = Field(default=None, description='S3 对象 URI')
+
+    # 通用元数据
+    mime_type: str | None = Field(default=None, description='MIME 类型')
+    description: str | None = Field(default=None, description='LLM 生成的内容描述')
+    semantic_role: SemanticRole = Field(default=SemanticRole.body, description='语义角色')
+    language: str | None = Field(default=None, description='内容语言 ISO 639-1')
+
+    # 来源追溯
+    source_page: int | None = Field(default=None, description='来源页码，从 1 开始')
+    source_location: dict | None = Field(default=None, description='来源位置信息')
+
+    # 层次结构
+    parent_index: int | None = Field(default=None, description='父块的 index')
+
+    # 扩展元数据
+    metadata: dict | None = Field(default=None, description='类型特有的扩展元数据')
+
+    # 处理状态
+    embedding_generated: bool = Field(default=False, description='是否已生成 embedding')
+
+    # 临时字段（不序列化）— 预处理管道中暂存二进制数据
+    _raw_bytes: bytes | None = None
+    # 预计算的 embedding（不序列化）— 图片等二进制块的向量，
+    # 在 add_document_episode 中生成，供后续 source_excerpt embedding 使用
+    _embedding: list[float] | None = None
+
+    @property
+    def is_binary(self) -> bool:
+        """是否为二进制内容（需要 S3 存储）"""
+        return self.block_type in (
+            ContentBlockType.image,
+            ContentBlockType.audio,
+            ContentBlockType.video,
+            ContentBlockType.chart,
+            ContentBlockType.slide,
+        )
+
+    @property
+    def text_representation(self) -> str:
+        """获取该块的纯文本表示"""
+        if self.text:
+            return self.text
+        if self.description:
+            return f'[{self.block_type.value}: {self.description}]'
+        if self.s3_uri:
+            return f'[{self.block_type.value}: {self.s3_uri}]'
+        return f'[{self.block_type.value}]'
+
+
+def build_content_from_blocks(blocks: list[ContentBlock]) -> str:
+    """将 content_blocks 转换为纯文本表示。"""
+    parts = []
+    for block in sorted(blocks, key=lambda b: b.index):
+        if block.parent_index is not None:
+            continue
+        parts.append(block.text_representation)
+    return '\n'.join(parts)
+
+
+# Regex pattern matching multimodal excerpt references: [image:s3://bucket/key] ...
+import re
+
+_MULTIMODAL_REF_PATTERN = re.compile(
+    r'^\[(image|audio|video|chart|slide):(s3://[^\]]+)\]'
+)
+
+
+def extract_s3_uri_from_excerpt(excerpt: str) -> str | None:
+    """Extract S3 URI from a multimodal excerpt reference.
+
+    Returns the s3_uri if the excerpt starts with [type:s3://...], else None.
+    """
+    m = _MULTIMODAL_REF_PATTERN.match(excerpt.strip())
+    return m.group(2) if m else None
+
+
+def build_image_embedding_map(blocks: list[ContentBlock]) -> dict[str, list[float]]:
+    """Build a mapping from s3_uri → pre-computed image embedding.
+
+    Used by embedding functions to substitute image vectors for excerpts
+    that reference binary content blocks (e.g. [image:s3://...]).
+    """
+    result: dict[str, list[float]] = {}
+    for block in blocks:
+        if block.s3_uri and block._embedding:
+            result[block.s3_uri] = block._embedding
+    return result
+
+# Pattern for parsing all multimodal references within an excerpt (global search)
+_MULTIMODAL_REF_GLOBAL_PATTERN = re.compile(
+    r'\[(image|audio|video|chart|slide):(s3://[^\]]+)\]\s*(.*?)(?=\[(?:image|audio|video|chart|slide):|$)',
+    re.DOTALL,
+)
+
+
+def parse_excerpt_references(excerpt: str) -> list[dict[str, str]]:
+    """Parse multimodal references in an excerpt string.
+
+    Returns a list of dicts, each with keys:
+    - ``type``: ``'text'``, ``'image'``, ``'audio'``, ``'video'``, ``'chart'``, or ``'slide'``
+    - ``s3_uri`` (only for non-text): the S3 URI
+    - ``description`` (only for non-text): the description text after the reference marker
+    - ``content`` (only for text): the plain text content
+
+    This is intended for frontend rendering of search results that may
+    contain ``[image:s3://...] description`` style markers.
+    """
+    refs: list[dict[str, str]] = []
+    matches = list(_MULTIMODAL_REF_GLOBAL_PATTERN.finditer(excerpt))
+
+    if not matches:
+        # Pure text excerpt
+        if excerpt.strip():
+            return [{'type': 'text', 'content': excerpt.strip()}]
+        return []
+
+    # Collect text before the first match
+    leading_text = excerpt[: matches[0].start()].strip()
+    if leading_text:
+        refs.append({'type': 'text', 'content': leading_text})
+
+    for match in matches:
+        refs.append({
+            'type': match.group(1),
+            's3_uri': match.group(2),
+            'description': match.group(3).strip(),
+        })
+
+    return refs
 
 
 class Node(BaseModel, ABC):
@@ -315,6 +501,18 @@ class EpisodicNode(Node):
         description='list of entity edges referenced in this episode',
         default_factory=list,
     )
+    narrative_excerpts: list[str] = Field(
+        description='text fragments from the episode not covered by any extracted edge',
+        default_factory=list,
+    )
+    describes_edges: list[str] = Field(
+        description='list of describes edge UUIDs referenced in this episode',
+        default_factory=list,
+    )
+    content_blocks: list[ContentBlock] = Field(
+        description='有序内容块列表，document 类型 episode 的完整内容表示',
+        default_factory=list,
+    )
 
     async def save(self, driver: GraphDriver):
         if driver.graph_operations_interface:
@@ -330,6 +528,12 @@ class EpisodicNode(Node):
             'source_description': self.source_description,
             'content': self.content,
             'entity_edges': self.entity_edges,
+            'narrative_excerpts': json.dumps(self.narrative_excerpts, ensure_ascii=False),
+            'describes_edges': json.dumps(self.describes_edges, ensure_ascii=False),
+            'content_blocks': json.dumps(
+                [block.model_dump(mode='json') for block in self.content_blocks],
+                ensure_ascii=False,
+            ) if self.content_blocks else '[]',
             'created_at': self.created_at,
             'valid_at': self.valid_at,
             'source': self.source.value,
@@ -479,6 +683,28 @@ class EpisodicNode(Node):
         episodes = [get_episodic_node_from_record(record) for record in records]
 
         return episodes
+    @classmethod
+    async def get_by_name_and_group(
+        cls, driver: GraphDriver, name: str, group_id: str
+    ) -> 'EpisodicNode | None':
+        """Return an existing episode with the given name and group_id, or None."""
+        records, _, _ = await driver.execute_query(
+            """
+            MATCH (e:Episodic {name: $name, group_id: $group_id})
+            RETURN
+            """
+            + (
+                EPISODIC_NODE_RETURN_NEPTUNE
+                if driver.provider == GraphProvider.NEPTUNE
+                else EPISODIC_NODE_RETURN
+            ),
+            name=name,
+            group_id=group_id,
+            routing_='r',
+        )
+        if not records:
+            return None
+        return get_episodic_node_from_record(records[0])
 
 
 class EntityNode(Node):
@@ -987,6 +1213,32 @@ class SagaNode(Node):
 
 
 # Node helpers
+def _parse_json_list(raw: str | list | None) -> list[str]:
+    """Parse a JSON-encoded list from Neo4j, with fallback for legacy '|'-delimited format."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else [raw]
+    except (json.JSONDecodeError, TypeError):
+        return raw.split('|') if raw else []  # compat with legacy data
+
+
+def _parse_content_blocks(raw: str | list | None) -> list[ContentBlock]:
+    """Parse content_blocks from Neo4j JSON string."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [ContentBlock(**b) if isinstance(b, dict) else b for b in raw]
+    try:
+        parsed = json.loads(raw)
+        return [ContentBlock(**b) for b in parsed] if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def get_episodic_node_from_record(record: Any) -> EpisodicNode:
     created_at = parse_db_date(record['created_at'])
     valid_at = parse_db_date(record['valid_at'])
@@ -1006,6 +1258,9 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
         name=record['name'],
         source_description=record['source_description'],
         entity_edges=record['entity_edges'],
+        narrative_excerpts=_parse_json_list(record.get('narrative_excerpts')),
+        describes_edges=_parse_json_list(record.get('describes_edges')),
+        content_blocks=_parse_content_blocks(record.get('content_blocks')),
     )
 
 

@@ -34,5 +34,20 @@ class EmbedderClient(ABC):
     ) -> list[float]:
         pass
 
+    async def create_image(
+        self,
+        image_bytes: bytes,
+        image_format: str = 'jpeg',
+        text: str | None = None,
+    ) -> list[float]:
+        """Generate embedding for an image, optionally with text context.
+
+        Default raises NotImplementedError. Only multimodal-capable
+        embedders (e.g. BedrockNovaEmbedder) implement this.
+        """
+        raise NotImplementedError(
+            f'{type(self).__name__} does not support image embedding'
+        )
+
     async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
         raise NotImplementedError()

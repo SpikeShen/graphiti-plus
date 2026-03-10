@@ -316,3 +316,26 @@ NEXT_EPISODE_EDGE_RETURN = """
     m.uuid AS target_node_uuid,
     e.created_at AS created_at
 """
+
+
+DESCRIBES_EDGE_SAVE = """
+    MATCH (ep:Episodic {uuid: $episode_uuid})
+    MATCH (en:Entity {uuid: $entity_uuid})
+    MERGE (ep)-[e:DESCRIBES {uuid: $uuid}]->(en)
+    SET
+        e.group_id = $group_id,
+        e.fact = $fact,
+        e.excerpt = $excerpt,
+        e.created_at = $created_at
+    RETURN e.uuid AS uuid
+"""
+
+DESCRIBES_EDGE_RETURN = """
+    e.uuid AS uuid,
+    e.group_id AS group_id,
+    startNode(e).uuid AS source_node_uuid,
+    endNode(e).uuid AS target_node_uuid,
+    e.fact AS fact,
+    e.excerpt AS excerpt,
+    e.created_at AS created_at
+"""

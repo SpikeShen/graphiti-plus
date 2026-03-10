@@ -18,7 +18,7 @@ from typing import Any
 
 from graphiti_core.edges import EntityEdge
 from graphiti_core.helpers import parse_db_date
-from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
+from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode, _parse_content_blocks
 
 
 def entity_node_from_record(record: Any) -> EntityNode:
@@ -103,6 +103,9 @@ def episodic_node_from_record(record: Any) -> EpisodicNode:
         name=record['name'],
         source_description=record['source_description'],
         entity_edges=record['entity_edges'],
+        narrative_excerpts=record.get('narrative_excerpts') or [],
+        describes_edges=record.get('describes_edges') or [],
+        content_blocks=_parse_content_blocks(record.get('content_blocks')),
     )
 
 

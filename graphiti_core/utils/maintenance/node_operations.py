@@ -142,7 +142,16 @@ async def _extract_nodes_single(
 ) -> list[ExtractedEntity]:
     """Extract entities using a single LLM call."""
     llm_response = await _call_extraction_llm(llm_client, episode, context)
-    response_object = ExtractedEntities(**llm_response)
+    try:
+        response_object = ExtractedEntities(**llm_response)
+    except Exception as _val_err:
+        logger.warning('ExtractedEntities validation failed (%s), retrying...', _val_err)
+        llm_response = await _call_extraction_llm(llm_client, episode, context)
+        try:
+            response_object = ExtractedEntities(**llm_response)
+        except Exception:
+            logger.warning('ExtractedEntities validation failed again, returning empty.')
+            return []
     return response_object.extracted_entities
 
 

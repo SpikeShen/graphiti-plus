@@ -167,7 +167,24 @@ async def extract_edges(
         group_id=group_id,
         prompt_name=prompt_name,
     )
-    extracted = ExtractedEdges(**llm_response)
+    try:
+        extracted = ExtractedEdges(**llm_response)
+    except Exception as _val_err:
+        logger.warning(
+            'ExtractedEdges validation failed (%s), retrying once...', _val_err,
+        )
+        llm_response = await llm_client.generate_response(
+            prompt,
+            response_model=ExtractedEdges,
+            max_tokens=extract_edges_max_tokens,
+            group_id=group_id,
+            prompt_name=prompt_name,
+        )
+        try:
+            extracted = ExtractedEdges(**llm_response)
+        except Exception:
+            logger.warning('ExtractedEdges validation failed again, returning empty.')
+            return [], []
     all_edges_data = extracted.edges
     narrative_excerpts = extracted.narrative_excerpts
 
